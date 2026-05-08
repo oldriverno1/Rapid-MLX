@@ -2038,14 +2038,26 @@ class Scheduler:
                 min_p=request.sampling_params.min_p,
             )
 
+            segments = _maybe_split_at_boundary(
+                tokens_to_process,
+                getattr(request, "prefix_boundary", 0) or 0,
+                getattr(request, "cached_tokens", 0) or 0,
+            )
+            insert_kwargs = dict(
+                max_tokens=[request.sampling_params.max_tokens],
+                caches=[cache_to_use] if cache_to_use else None,
+                samplers=[request_sampler],
+                logits_processors=request_logits_processors,
+            )
             try:
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
-                    caches=[cache_to_use] if cache_to_use else None,
-                    samplers=[request_sampler],
-                    logits_processors=request_logits_processors,
-                )
+                if segments is not None:
+                    uids = self.batch_generator.insert_segments(
+                        [segments], **insert_kwargs
+                    )
+                else:
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process], **insert_kwargs
+                    )
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(
@@ -2057,13 +2069,21 @@ class Scheduler:
                     request.cached_tokens = 0
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
-                    uids = self.batch_generator.insert(
-                        [tokens_to_process],
-                        max_tokens=[request.sampling_params.max_tokens],
-                        caches=None,
-                        samplers=[request_sampler],
-                        logits_processors=request_logits_processors,
+                    retry_segments = _maybe_split_at_boundary(
+                        tokens_to_process,
+                        getattr(request, "prefix_boundary", 0) or 0,
+                        0,
                     )
+                    retry_kwargs = dict(insert_kwargs)
+                    retry_kwargs["caches"] = None
+                    if retry_segments is not None:
+                        uids = self.batch_generator.insert_segments(
+                            [retry_segments], **retry_kwargs
+                        )
+                    else:
+                        uids = self.batch_generator.insert(
+                            [tokens_to_process], **retry_kwargs
+                        )
                 else:
                     raise
 
