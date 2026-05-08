@@ -597,6 +597,35 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+def _maybe_split_at_boundary(
+    tokens_to_process: list[int],
+    prefix_boundary: int,
+    cached_tokens: int,
+) -> list[list[int]] | None:
+    """Split a prompt token list at the chat-template-stable boundary.
+
+    Used by ``Scheduler._schedule_waiting`` to pass two segments into
+    ``BatchGenerator.insert_segments`` so the BatchGenerator emits a
+    ``Response(end_of_segment=True, end_of_prompt=False)`` at the boundary.
+    ``Scheduler._snapshot_promoted_prompts`` consumes that signal to
+    capture the cache state and store it under
+    ``prompt_token_ids[:prefix_boundary]`` in ``MemoryAwarePrefixCache``.
+
+    Returns ``None`` when no split is needed — boundary outside the
+    remaining tokens, or already covered by ``cached_tokens``. Caller
+    falls back to the single-segment ``insert`` path. See issue #214.
+    """
+    if not tokens_to_process or prefix_boundary <= 0:
+        return None
+    effective_boundary = prefix_boundary - cached_tokens
+    if effective_boundary <= 0 or effective_boundary >= len(tokens_to_process):
+        return None
+    return [
+        list(tokens_to_process[:effective_boundary]),
+        list(tokens_to_process[effective_boundary:]),
+    ]
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -1325,17 +1354,15 @@ class Scheduler:
     def _make_prompt_cache_save_callback(self):
         """Create a callback that stores prompt-only KV/Mamba cache.
 
-        Called from ``_generation_step`` right before the first output token
-        is fed into the model.  At that point ``num_tokens == 0`` and the
-        batch cache contains the exact prompt-only state (correct for both
-        KVCache and MambaCache/ArraysCache layers).
-
-        The cache is stored with key = prompt_token_ids so that a future
-        request with the identical prompt gets an exact hit.
+        The callback accepts an optional ``prompt_token_count`` so it can
+        snapshot at a chat-template-stable boundary inside the prompt
+        (used for hybrid models in agentic multi-turn — see issue #214).
+        When omitted, the full ``prompt_token_ids`` is used as the key,
+        matching the original end-of-prompt snapshot behavior (issue #163).
         """
         import time as _time
 
-        def _prompt_cache_save(uid, extracted_cache):
+        def _prompt_cache_save(uid, extracted_cache, prompt_token_count=None):
             request_id = self.uid_to_request_id.get(uid)
             if not request_id:
                 return
@@ -1343,11 +1370,17 @@ class Scheduler:
             if not request or not request.prompt_token_ids:
                 return
 
-            prompt_tokens = list(request.prompt_token_ids)
+            if prompt_token_count is None:
+                prompt_tokens = list(request.prompt_token_ids)
+            else:
+                prompt_tokens = list(request.prompt_token_ids[:prompt_token_count])
+            if not prompt_tokens:
+                return
+
             _t0 = _time.monotonic()
-            # evict_prefixes=False: keep mid-prefill boundary entries so
-            # that future requests with the same prefix but different
-            # suffix get a prefix cache hit (critical for agentic multi-turn).
+            # evict_prefixes=False: keep boundary entries so future requests
+            # with the same prefix but different suffix get a prefix cache
+            # hit (critical for agentic multi-turn on hybrid models, #214).
             stored = self.memory_aware_cache.store(
                 prompt_tokens, extracted_cache, evict_prefixes=False
             )
@@ -1362,50 +1395,81 @@ class Scheduler:
         return _prompt_cache_save
 
     def _snapshot_promoted_prompts(self, prompt_responses) -> None:
-        """Snapshot prompt-only cache for sequences just promoted to generation.
+        """Snapshot prompt-only cache at end-of-prompt and at intra-prompt
+        segment boundaries (issue #214).
 
-        Reads the public ``end_of_prompt`` flag from mlx-lm 0.31+'s prompt
-        responses, then uses the public ``BatchGenerator.extract_cache`` API
-        to capture the per-uid cache state. Each capture is forwarded to the
-        prompt-cache-save callback so a future request with the identical
-        prompt finds an exact-match entry in the prefix cache.
+        Reads ``end_of_prompt`` and ``end_of_segment`` flags from mlx-lm
+        0.31+'s ``PromptProcessingBatch.Response``, then uses
+        ``BatchGenerator.extract_cache`` to capture the per-uid cache
+        state.
 
-        This is the new-API equivalent of the ``_patched_process_prompts``
-        hook installed by ``_install_chunked_prefill`` for the legacy Batch
-        API. Without it, hybrid models (Mamba/DeltaNet+Transformer) MISS
-        the prefix cache forever because their non-trimmable cache layers
-        cannot satisfy the supersequence fallback path (issue #163).
+        End-of-prompt snapshots use the full prompt as the key (issue #163).
+        End-of-segment snapshots (without end-of-prompt) use
+        ``prompt_token_ids[:prefix_boundary]`` so a future request with the
+        same chat-template-stable prefix gets a prefix-cache hit. Without
+        the boundary path, hybrid models (Mamba/DeltaNet+Transformer) miss
+        the prefix cache forever in agentic multi-turn because their
+        non-trimmable cache layers cannot satisfy the supersequence
+        fallback (issue #214).
         """
         if self._prompt_cache_save_cb is None or not prompt_responses:
             return
 
-        promoted_uids = [
-            resp.uid
-            for resp in prompt_responses
-            if getattr(resp, "end_of_prompt", False)
-        ]
-        if not promoted_uids:
+        end_of_prompt_uids: list[int] = []
+        boundary_uids: list[tuple[int, int]] = []  # (uid, prompt_token_count)
+        for resp in prompt_responses:
+            if getattr(resp, "end_of_prompt", False):
+                end_of_prompt_uids.append(resp.uid)
+            elif getattr(resp, "end_of_segment", False):
+                request_id = self.uid_to_request_id.get(resp.uid)
+                request = (
+                    self.requests.get(request_id) if request_id else None
+                )
+                pb = getattr(request, "prefix_boundary", 0) if request else 0
+                if pb > 0:
+                    boundary_uids.append((resp.uid, pb))
+
+        if not end_of_prompt_uids and not boundary_uids:
             return
 
+        uids_to_extract = (
+            end_of_prompt_uids + [u for u, _ in boundary_uids]
+        )
         try:
-            extracted = self.batch_generator.extract_cache(promoted_uids)
+            extracted = self.batch_generator.extract_cache(uids_to_extract)
         except Exception as exc:
-            logger.debug("[prompt_cache_save] extract_cache failed: %s", exc)
+            logger.debug(
+                "[prompt_cache_save] extract_cache failed: %s",
+                exc,
+            )
             return
 
-        for uid, payload in extracted.items():
-            # Promoted sequences (stage == 2) return (cache, tokens). Any
-            # other shape means the uid was already removed before the
-            # snapshot — skip silently.
+        for uid in end_of_prompt_uids:
+            payload = extracted.get(uid)
             if isinstance(payload, tuple) and len(payload) == 2:
                 cache, _tokens = payload
                 try:
                     self._prompt_cache_save_cb(uid, cache)
                 except Exception as exc:
                     logger.debug(
-                        "[prompt_cache_save] callback failed for uid=%s: %s",
-                        uid,
-                        exc,
+                        "[prompt_cache_save] callback failed for "
+                        "uid=%s: %s",
+                        uid, exc,
+                    )
+
+        for uid, prompt_token_count in boundary_uids:
+            payload = extracted.get(uid)
+            if isinstance(payload, tuple) and len(payload) == 2:
+                cache, _tokens = payload
+                try:
+                    self._prompt_cache_save_cb(
+                        uid, cache, prompt_token_count=prompt_token_count
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[prompt_cache_save] boundary callback failed "
+                        "for uid=%s: %s",
+                        uid, exc,
                     )
 
     def _make_mid_prefill_save_callback(self, save_interval: int):
@@ -2005,14 +2069,26 @@ class Scheduler:
                 min_p=request.sampling_params.min_p,
             )
 
+            segments = _maybe_split_at_boundary(
+                tokens_to_process,
+                getattr(request, "prefix_boundary", 0) or 0,
+                getattr(request, "cached_tokens", 0) or 0,
+            )
+            insert_kwargs = dict(
+                max_tokens=[request.sampling_params.max_tokens],
+                caches=[cache_to_use] if cache_to_use else None,
+                samplers=[request_sampler],
+                logits_processors=request_logits_processors,
+            )
             try:
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
-                    caches=[cache_to_use] if cache_to_use else None,
-                    samplers=[request_sampler],
-                    logits_processors=request_logits_processors,
-                )
+                if segments is not None:
+                    uids = self.batch_generator.insert_segments(
+                        [segments], **insert_kwargs
+                    )
+                else:
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process], **insert_kwargs
+                    )
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(
@@ -2024,13 +2100,21 @@ class Scheduler:
                     request.cached_tokens = 0
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
-                    uids = self.batch_generator.insert(
-                        [tokens_to_process],
-                        max_tokens=[request.sampling_params.max_tokens],
-                        caches=None,
-                        samplers=[request_sampler],
-                        logits_processors=request_logits_processors,
+                    retry_segments = _maybe_split_at_boundary(
+                        tokens_to_process,
+                        getattr(request, "prefix_boundary", 0) or 0,
+                        0,
                     )
+                    retry_kwargs = dict(insert_kwargs)
+                    retry_kwargs["caches"] = None
+                    if retry_segments is not None:
+                        uids = self.batch_generator.insert_segments(
+                            [retry_segments], **retry_kwargs
+                        )
+                    else:
+                        uids = self.batch_generator.insert(
+                            [tokens_to_process], **retry_kwargs
+                        )
                 else:
                     raise
 
