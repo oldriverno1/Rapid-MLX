@@ -1325,17 +1325,15 @@ class Scheduler:
     def _make_prompt_cache_save_callback(self):
         """Create a callback that stores prompt-only KV/Mamba cache.
 
-        Called from ``_generation_step`` right before the first output token
-        is fed into the model.  At that point ``num_tokens == 0`` and the
-        batch cache contains the exact prompt-only state (correct for both
-        KVCache and MambaCache/ArraysCache layers).
-
-        The cache is stored with key = prompt_token_ids so that a future
-        request with the identical prompt gets an exact hit.
+        The callback accepts an optional ``prompt_token_count`` so it can
+        snapshot at a chat-template-stable boundary inside the prompt
+        (used for hybrid models in agentic multi-turn — see issue #214).
+        When omitted, the full ``prompt_token_ids`` is used as the key,
+        matching the original end-of-prompt snapshot behavior (issue #163).
         """
         import time as _time
 
-        def _prompt_cache_save(uid, extracted_cache):
+        def _prompt_cache_save(uid, extracted_cache, prompt_token_count=None):
             request_id = self.uid_to_request_id.get(uid)
             if not request_id:
                 return
@@ -1343,11 +1341,17 @@ class Scheduler:
             if not request or not request.prompt_token_ids:
                 return
 
-            prompt_tokens = list(request.prompt_token_ids)
+            if prompt_token_count is None:
+                prompt_tokens = list(request.prompt_token_ids)
+            else:
+                prompt_tokens = list(request.prompt_token_ids[:prompt_token_count])
+            if not prompt_tokens:
+                return
+
             _t0 = _time.monotonic()
-            # evict_prefixes=False: keep mid-prefill boundary entries so
-            # that future requests with the same prefix but different
-            # suffix get a prefix cache hit (critical for agentic multi-turn).
+            # evict_prefixes=False: keep boundary entries so future requests
+            # with the same prefix but different suffix get a prefix cache
+            # hit (critical for agentic multi-turn on hybrid models, #214).
             stored = self.memory_aware_cache.store(
                 prompt_tokens, extracted_cache, evict_prefixes=False
             )

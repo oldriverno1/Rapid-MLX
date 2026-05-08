@@ -162,6 +162,17 @@ class TestPromptCacheSnapshot:
         scheduler._snapshot_promoted_prompts([])
         scheduler.batch_generator.extract_cache.assert_not_called()
 
+    def test_callback_stores_truncated_key_when_count_given(self):
+        scheduler = _make_scheduler_with_cache()
+        _register(scheduler, "req-1", uid=101, prompt_tokens=[10, 20, 30, 40, 50])
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        fake_cache = [object()]
+        scheduler._prompt_cache_save_cb(101, fake_cache, prompt_token_count=3)
+
+        stored_tokens = scheduler.memory_aware_cache.store.call_args.args[0]
+        assert stored_tokens == [10, 20, 30]
+
     def test_snapshot_stores_only_end_of_prompt_subset(self):
         scheduler = _make_scheduler_with_cache()
         _register(scheduler, "req-a", uid=1, prompt_tokens=[1, 2])
