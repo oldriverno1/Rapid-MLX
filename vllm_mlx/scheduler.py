@@ -1395,50 +1395,81 @@ class Scheduler:
         return _prompt_cache_save
 
     def _snapshot_promoted_prompts(self, prompt_responses) -> None:
-        """Snapshot prompt-only cache for sequences just promoted to generation.
+        """Snapshot prompt-only cache at end-of-prompt and at intra-prompt
+        segment boundaries (issue #214).
 
-        Reads the public ``end_of_prompt`` flag from mlx-lm 0.31+'s prompt
-        responses, then uses the public ``BatchGenerator.extract_cache`` API
-        to capture the per-uid cache state. Each capture is forwarded to the
-        prompt-cache-save callback so a future request with the identical
-        prompt finds an exact-match entry in the prefix cache.
+        Reads ``end_of_prompt`` and ``end_of_segment`` flags from mlx-lm
+        0.31+'s ``PromptProcessingBatch.Response``, then uses
+        ``BatchGenerator.extract_cache`` to capture the per-uid cache
+        state.
 
-        This is the new-API equivalent of the ``_patched_process_prompts``
-        hook installed by ``_install_chunked_prefill`` for the legacy Batch
-        API. Without it, hybrid models (Mamba/DeltaNet+Transformer) MISS
-        the prefix cache forever because their non-trimmable cache layers
-        cannot satisfy the supersequence fallback path (issue #163).
+        End-of-prompt snapshots use the full prompt as the key (issue #163).
+        End-of-segment snapshots (without end-of-prompt) use
+        ``prompt_token_ids[:prefix_boundary]`` so a future request with the
+        same chat-template-stable prefix gets a prefix-cache hit. Without
+        the boundary path, hybrid models (Mamba/DeltaNet+Transformer) miss
+        the prefix cache forever in agentic multi-turn because their
+        non-trimmable cache layers cannot satisfy the supersequence
+        fallback (issue #214).
         """
         if self._prompt_cache_save_cb is None or not prompt_responses:
             return
 
-        promoted_uids = [
-            resp.uid
-            for resp in prompt_responses
-            if getattr(resp, "end_of_prompt", False)
-        ]
-        if not promoted_uids:
+        end_of_prompt_uids: list[int] = []
+        boundary_uids: list[tuple[int, int]] = []  # (uid, prompt_token_count)
+        for resp in prompt_responses:
+            if getattr(resp, "end_of_prompt", False):
+                end_of_prompt_uids.append(resp.uid)
+            elif getattr(resp, "end_of_segment", False):
+                request_id = self.uid_to_request_id.get(resp.uid)
+                request = (
+                    self.requests.get(request_id) if request_id else None
+                )
+                pb = getattr(request, "prefix_boundary", 0) if request else 0
+                if pb > 0:
+                    boundary_uids.append((resp.uid, pb))
+
+        if not end_of_prompt_uids and not boundary_uids:
             return
 
+        uids_to_extract = (
+            end_of_prompt_uids + [u for u, _ in boundary_uids]
+        )
         try:
-            extracted = self.batch_generator.extract_cache(promoted_uids)
+            extracted = self.batch_generator.extract_cache(uids_to_extract)
         except Exception as exc:
-            logger.debug("[prompt_cache_save] extract_cache failed: %s", exc)
+            logger.debug(
+                "[prompt_cache_save] extract_cache failed: %s",
+                exc,
+            )
             return
 
-        for uid, payload in extracted.items():
-            # Promoted sequences (stage == 2) return (cache, tokens). Any
-            # other shape means the uid was already removed before the
-            # snapshot — skip silently.
+        for uid in end_of_prompt_uids:
+            payload = extracted.get(uid)
             if isinstance(payload, tuple) and len(payload) == 2:
                 cache, _tokens = payload
                 try:
                     self._prompt_cache_save_cb(uid, cache)
                 except Exception as exc:
                     logger.debug(
-                        "[prompt_cache_save] callback failed for uid=%s: %s",
-                        uid,
-                        exc,
+                        "[prompt_cache_save] callback failed for "
+                        "uid=%s: %s",
+                        uid, exc,
+                    )
+
+        for uid, prompt_token_count in boundary_uids:
+            payload = extracted.get(uid)
+            if isinstance(payload, tuple) and len(payload) == 2:
+                cache, _tokens = payload
+                try:
+                    self._prompt_cache_save_cb(
+                        uid, cache, prompt_token_count=prompt_token_count
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[prompt_cache_save] boundary callback failed "
+                        "for uid=%s: %s",
+                        uid, exc,
                     )
 
     def _make_mid_prefill_save_callback(self, save_interval: int):

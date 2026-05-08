@@ -85,22 +85,57 @@ class TestPromptCacheSnapshot:
         assert stored_tokens == prompt_tokens
         assert stored_cache is fake_cache_layers
 
-    def test_snapshot_skips_mid_prompt_chunks(self):
+    def test_snapshot_skips_mid_prompt_chunks_without_boundary(self):
+        # When request has prefix_boundary=0, an end_of_segment=True
+        # response is just an mlx-lm internal chunk — no snapshot.
         scheduler = _make_scheduler_with_cache()
-        _register(scheduler, "req-1", uid=101, prompt_tokens=[1, 2, 3])
+        req = _register(scheduler, "req-1", uid=101, prompt_tokens=[1, 2, 3])
+        req.prefix_boundary = 0
         bg = MagicMock()
         scheduler.batch_generator = bg
         scheduler.memory_aware_cache.store = MagicMock()
 
         responses = [
             SimpleNamespace(
-                uid=101, progress=(2, 4), end_of_segment=True, end_of_prompt=False
+                uid=101, progress=(2, 4),
+                end_of_segment=True, end_of_prompt=False,
             ),
         ]
         scheduler._snapshot_promoted_prompts(responses)
 
         bg.extract_cache.assert_not_called()
         scheduler.memory_aware_cache.store.assert_not_called()
+
+    def test_snapshot_at_boundary_when_end_of_segment_and_boundary_set(self):
+        # When end_of_segment=True fires AND request.prefix_boundary > 0,
+        # snapshot is taken with key = prompt_token_ids[:prefix_boundary].
+        scheduler = _make_scheduler_with_cache()
+        req = _register(
+            scheduler, "req-1", uid=101,
+            prompt_tokens=[10, 20, 30, 40, 50, 60],
+        )
+        req.prefix_boundary = 4
+
+        fake_cache = [object()]
+        bg = MagicMock()
+        # extract_cache for stage 1 (still in prompt batch) returns
+        # (cache, tokens_so_far) for the segment processed so far.
+        bg.extract_cache.return_value = {101: (fake_cache, [10, 20, 30, 40])}
+        scheduler.batch_generator = bg
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        responses = [
+            SimpleNamespace(
+                uid=101, progress=(4, 6),
+                end_of_segment=True, end_of_prompt=False,
+            ),
+        ]
+        scheduler._snapshot_promoted_prompts(responses)
+
+        bg.extract_cache.assert_called_once_with([101])
+        scheduler.memory_aware_cache.store.assert_called_once()
+        stored_tokens = scheduler.memory_aware_cache.store.call_args.args[0]
+        assert stored_tokens == [10, 20, 30, 40]
 
     def test_snapshot_handles_extract_failure(self):
         scheduler = _make_scheduler_with_cache()
