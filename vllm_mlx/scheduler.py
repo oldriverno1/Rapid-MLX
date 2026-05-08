@@ -597,6 +597,35 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+def _maybe_split_at_boundary(
+    tokens_to_process: list[int],
+    prefix_boundary: int,
+    cached_tokens: int,
+) -> list[list[int]] | None:
+    """Split a prompt token list at the chat-template-stable boundary.
+
+    Used by ``Scheduler._schedule_waiting`` to pass two segments into
+    ``BatchGenerator.insert_segments`` so the BatchGenerator emits a
+    ``Response(end_of_segment=True, end_of_prompt=False)`` at the boundary.
+    ``Scheduler._snapshot_promoted_prompts`` consumes that signal to
+    capture the cache state and store it under
+    ``prompt_token_ids[:prefix_boundary]`` in ``MemoryAwarePrefixCache``.
+
+    Returns ``None`` when no split is needed — boundary outside the
+    remaining tokens, or already covered by ``cached_tokens``. Caller
+    falls back to the single-segment ``insert`` path. See issue #214.
+    """
+    if not tokens_to_process or prefix_boundary <= 0:
+        return None
+    effective_boundary = prefix_boundary - cached_tokens
+    if effective_boundary <= 0 or effective_boundary >= len(tokens_to_process):
+        return None
+    return [
+        list(tokens_to_process[:effective_boundary]),
+        list(tokens_to_process[effective_boundary:]),
+    ]
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
